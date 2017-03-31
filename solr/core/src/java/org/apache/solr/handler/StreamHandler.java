@@ -18,6 +18,7 @@ package org.apache.solr.handler;
 
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -29,42 +30,30 @@ import org.apache.solr.client.solrj.io.ModelCache;
 import org.apache.solr.client.solrj.io.SolrClientCache;
 import org.apache.solr.client.solrj.io.Tuple;
 import org.apache.solr.client.solrj.io.comp.StreamComparator;
+import org.apache.solr.client.solrj.io.eval.AbsoluteValueEvaluator;
+import org.apache.solr.client.solrj.io.eval.AddEvaluator;
+import org.apache.solr.client.solrj.io.eval.AndEvaluator;
+import org.apache.solr.client.solrj.io.eval.DivideEvaluator;
+import org.apache.solr.client.solrj.io.eval.EqualsEvaluator;
+import org.apache.solr.client.solrj.io.eval.ExclusiveOrEvaluator;
+import org.apache.solr.client.solrj.io.eval.GreaterThanEqualToEvaluator;
+import org.apache.solr.client.solrj.io.eval.GreaterThanEvaluator;
+import org.apache.solr.client.solrj.io.eval.IfThenElseEvaluator;
+import org.apache.solr.client.solrj.io.eval.LessThanEqualToEvaluator;
+import org.apache.solr.client.solrj.io.eval.LessThanEvaluator;
+import org.apache.solr.client.solrj.io.eval.MultiplyEvaluator;
+import org.apache.solr.client.solrj.io.eval.NaturalLogEvaluator;
+import org.apache.solr.client.solrj.io.eval.NotEvaluator;
+import org.apache.solr.client.solrj.io.eval.OrEvaluator;
+import org.apache.solr.client.solrj.io.eval.RawValueEvaluator;
+import org.apache.solr.client.solrj.io.eval.SubtractEvaluator;
 import org.apache.solr.client.solrj.io.graph.GatherNodesStream;
 import org.apache.solr.client.solrj.io.graph.ShortestPathStream;
 import org.apache.solr.client.solrj.io.ops.ConcatOperation;
 import org.apache.solr.client.solrj.io.ops.DistinctOperation;
 import org.apache.solr.client.solrj.io.ops.GroupOperation;
 import org.apache.solr.client.solrj.io.ops.ReplaceOperation;
-import org.apache.solr.client.solrj.io.stream.CloudSolrStream;
-import org.apache.solr.client.solrj.io.stream.CommitStream;
-import org.apache.solr.client.solrj.io.stream.ComplementStream;
-import org.apache.solr.client.solrj.io.stream.DaemonStream;
-import org.apache.solr.client.solrj.io.stream.ExceptionStream;
-import org.apache.solr.client.solrj.io.stream.FacetStream;
-import org.apache.solr.client.solrj.io.stream.FeaturesSelectionStream;
-import org.apache.solr.client.solrj.io.stream.FetchStream;
-import org.apache.solr.client.solrj.io.stream.HashJoinStream;
-import org.apache.solr.client.solrj.io.stream.InnerJoinStream;
-import org.apache.solr.client.solrj.io.stream.IntersectStream;
-import org.apache.solr.client.solrj.io.stream.JDBCStream;
-import org.apache.solr.client.solrj.io.stream.LeftOuterJoinStream;
-import org.apache.solr.client.solrj.io.stream.MergeStream;
-import org.apache.solr.client.solrj.io.stream.ModelStream;
-import org.apache.solr.client.solrj.io.stream.OuterHashJoinStream;
-import org.apache.solr.client.solrj.io.stream.ParallelStream;
-import org.apache.solr.client.solrj.io.stream.RankStream;
-import org.apache.solr.client.solrj.io.stream.ReducerStream;
-import org.apache.solr.client.solrj.io.stream.RollupStream;
-import org.apache.solr.client.solrj.io.stream.ScoreNodesStream;
-import org.apache.solr.client.solrj.io.stream.SelectStream;
-import org.apache.solr.client.solrj.io.stream.SortStream;
-import org.apache.solr.client.solrj.io.stream.StatsStream;
-import org.apache.solr.client.solrj.io.stream.StreamContext;
-import org.apache.solr.client.solrj.io.stream.TextLogitStream;
-import org.apache.solr.client.solrj.io.stream.TopicStream;
-import org.apache.solr.client.solrj.io.stream.TupleStream;
-import org.apache.solr.client.solrj.io.stream.UniqueStream;
-import org.apache.solr.client.solrj.io.stream.UpdateStream;
+import org.apache.solr.client.solrj.io.stream.*;
 import org.apache.solr.client.solrj.io.stream.expr.Explanation;
 import org.apache.solr.client.solrj.io.stream.expr.Explanation.ExpressionType;
 import org.apache.solr.client.solrj.io.stream.expr.Expressible;
@@ -90,6 +79,9 @@ import org.apache.solr.security.PermissionNameProvider;
 import org.apache.solr.util.plugin.SolrCoreAware;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static org.apache.solr.common.params.CommonParams.ID;
+import static org.apache.solr.common.params.CommonParams.SORT;
 
 public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, PermissionNameProvider {
 
@@ -140,6 +132,7 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
       .withFunctionName("jdbc", JDBCStream.class)
       .withFunctionName("topic", TopicStream.class)
       .withFunctionName("commit", CommitStream.class)
+      .withFunctionName("random", RandomStream.class)
       
       // decorator streams
       .withFunctionName("merge", MergeStream.class)
@@ -156,18 +149,27 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
       .withFunctionName("outerHashJoin", OuterHashJoinStream.class)
       .withFunctionName("intersect", IntersectStream.class)
       .withFunctionName("complement", ComplementStream.class)
-      .withFunctionName("sort", SortStream.class)
+      .withFunctionName(SORT, SortStream.class)
       .withFunctionName("train", TextLogitStream.class)
       .withFunctionName("features", FeaturesSelectionStream.class)
       .withFunctionName("daemon", DaemonStream.class)
       .withFunctionName("shortestPath", ShortestPathStream.class)
       .withFunctionName("gatherNodes", GatherNodesStream.class)
+      .withFunctionName("nodes", GatherNodesStream.class)
       .withFunctionName("select", SelectStream.class)
+      .withFunctionName("shortestPath", ShortestPathStream.class)
+      .withFunctionName("gatherNodes", GatherNodesStream.class)
+      .withFunctionName("nodes", GatherNodesStream.class)
       .withFunctionName("scoreNodes", ScoreNodesStream.class)
       .withFunctionName("model", ModelStream.class)
       .withFunctionName("classify", ClassifyStream.class)
       .withFunctionName("fetch", FetchStream.class)
-
+      .withFunctionName("executor", ExecutorStream.class)
+      .withFunctionName("null", NullStream.class)
+      .withFunctionName("priority", PriorityStream.class)
+      .withFunctionName("significantTerms", SignificantTermsStream.class)
+      .withFunctionName("cartesianProduct", CartesianProductStream.class)
+      
       // metrics
       .withFunctionName("min", MinMetric.class)
       .withFunctionName("max", MaxMetric.class)
@@ -181,12 +183,39 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
       
       // stream reduction operations
       .withFunctionName("group", GroupOperation.class)
-      .withFunctionName("distinct", DistinctOperation.class);
+      .withFunctionName("distinct", DistinctOperation.class)
+      .withFunctionName("having", HavingStream.class)
+      
+      // Stream Evaluators
+      .withFunctionName("val", RawValueEvaluator.class)
+      
+      // Boolean Stream Evaluators
+      .withFunctionName("and", AndEvaluator.class)
+      .withFunctionName("eor", ExclusiveOrEvaluator.class)
+      .withFunctionName("eq", EqualsEvaluator.class)
+      .withFunctionName("gt", GreaterThanEvaluator.class)
+      .withFunctionName("gteq", GreaterThanEqualToEvaluator.class)
+      .withFunctionName("lt", LessThanEvaluator.class)
+      .withFunctionName("lteq", LessThanEqualToEvaluator.class)
+      .withFunctionName("not", NotEvaluator.class)
+      .withFunctionName("or", OrEvaluator.class)
+      
+      // Number Stream Evaluators
+      .withFunctionName("abs", AbsoluteValueEvaluator.class)
+      .withFunctionName("add", AddEvaluator.class)
+      .withFunctionName("div", DivideEvaluator.class)
+      .withFunctionName("mult", MultiplyEvaluator.class)
+      .withFunctionName("sub", SubtractEvaluator.class)
+      .withFunctionName("log", NaturalLogEvaluator.class)
+      // Conditional Stream Evaluators
+      .withFunctionName("if", IfThenElseEvaluator.class)
+      .withFunctionName("analyze", AnalyzeEvaluator.class)
+      ;
 
      // This pulls all the overrides and additions from the config
      List<PluginInfo> pluginInfos = core.getSolrConfig().getPluginInfos(Expressible.class.getName());
      for (PluginInfo pluginInfo : pluginInfos) {
-       Class<? extends Expressible> clazz = core.getResourceLoader().findClass(pluginInfo.className, Expressible.class);
+       Class<? extends Expressible> clazz = core.getMemClassLoader().findClass(pluginInfo.className, Expressible.class);
        streamFactory.withFunctionName(pluginInfo.name, clazz);
      }
         
@@ -228,6 +257,7 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
     int worker = params.getInt("workerID", 0);
     int numWorkers = params.getInt("numWorkers", 1);
     StreamContext context = new StreamContext();
+    context.put("shards", getCollectionShards(params));
     context.workerID = worker;
     context.numWorkers = numWorkers;
     context.setSolrClientCache(clientCache);
@@ -258,7 +288,7 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
   private void handleAdmin(SolrQueryRequest req, SolrQueryResponse rsp, SolrParams params) {
     String action = params.get("action");
     if("stop".equalsIgnoreCase(action)) {
-      String id = params.get("id");
+      String id = params.get(ID);
       DaemonStream d = daemons.get(id);
       if(d != null) {
         d.close();
@@ -266,21 +296,23 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
       } else {
         rsp.add("result-set", new DaemonResponseStream("Deamon:" + id + " not found on " + coreName));
       }
-    } else if("start".equalsIgnoreCase(action)) {
-      String id = params.get("id");
-      DaemonStream d = daemons.get(id);
-      d.open();
-      rsp.add("result-set", new DaemonResponseStream("Deamon:" + id + " started on " + coreName));
-    } else if("list".equalsIgnoreCase(action)) {
-      Collection<DaemonStream> vals = daemons.values();
-      rsp.add("result-set", new DaemonCollectionStream(vals));
-    } else if("kill".equalsIgnoreCase(action)) {
-      String id = params.get("id");
-      DaemonStream d = daemons.remove(id);
-      if (d != null) {
-        d.close();
+    } else {
+      if ("start".equalsIgnoreCase(action)) {
+        String id = params.get(ID);
+        DaemonStream d = daemons.get(id);
+        d.open();
+        rsp.add("result-set", new DaemonResponseStream("Deamon:" + id + " started on " + coreName));
+      } else if ("list".equalsIgnoreCase(action)) {
+        Collection<DaemonStream> vals = daemons.values();
+        rsp.add("result-set", new DaemonCollectionStream(vals));
+      } else if ("kill".equalsIgnoreCase(action)) {
+        String id = params.get("id");
+        DaemonStream d = daemons.remove(id);
+        if (d != null) {
+          d.close();
+        }
+        rsp.add("result-set", new DaemonResponseStream("Deamon:" + id + " killed on " + coreName));
       }
-      rsp.add("result-set", new DaemonResponseStream("Deamon:" + id + " killed on " + coreName));
     }
   }
 
@@ -489,6 +521,31 @@ public class StreamHandler extends RequestHandlerBase implements SolrCoreAware, 
         tuple.fields.put("RESPONSE_TIME", totalTime);
       }
       return tuple;
+    }
+  }
+
+  private Map<String, List<String>> getCollectionShards(SolrParams params) {
+
+    Map<String, List<String>> collectionShards = new HashMap();
+    Iterator<String> paramsIt = params.getParameterNamesIterator();
+    while(paramsIt.hasNext()) {
+      String param = paramsIt.next();
+      if(param.indexOf(".shards") > -1) {
+        String collection = param.split("\\.")[0];
+        String shardString = params.get(param);
+        String[] shards = shardString.split(",");
+        List<String> shardList = new ArrayList();
+        for(String shard : shards) {
+          shardList.add(shard);
+        }
+        collectionShards.put(collection, shardList);
+      }
+    }
+
+    if(collectionShards.size() > 0) {
+      return collectionShards;
+    } else {
+      return null;
     }
   }
 }

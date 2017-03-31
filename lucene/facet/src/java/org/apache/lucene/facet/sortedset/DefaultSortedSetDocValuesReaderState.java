@@ -36,7 +36,8 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.util.BytesRef;
 
 /**
- * Default implementation of {@link SortedSetDocValuesFacetCounts}
+ * Default implementation of {@link SortedSetDocValuesFacetCounts}. You must ensure the original
+ * {@link IndexReader} passed to the constructor is not closed whenever you use this class!
  */
 public class DefaultSortedSetDocValuesReaderState extends SortedSetDocValuesReaderState {
 
@@ -115,7 +116,8 @@ public class DefaultSortedSetDocValuesReaderState extends SortedSetDocValuesRead
         SortedSetDocValues dv = MultiDocValues.getSortedSetValues(origReader, field);
         if (dv instanceof MultiDocValues.MultiSortedSetDocValues) {
           map = ((MultiDocValues.MultiSortedSetDocValues)dv).mapping;
-          if (map.owner == origReader.getCoreCacheKey()) {
+          IndexReader.CacheHelper cacheHelper = origReader.getReaderCacheHelper();
+          if (cacheHelper != null && map.owner == cacheHelper.getKey()) {
             cachedOrdMaps.put(field, map);
           }
         }

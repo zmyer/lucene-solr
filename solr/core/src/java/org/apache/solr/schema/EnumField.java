@@ -43,7 +43,6 @@ import org.apache.lucene.legacy.LegacyNumericUtils;
 import org.apache.lucene.queries.function.ValueSource;
 import org.apache.lucene.queries.function.valuesource.EnumFieldSource;
 import org.apache.lucene.search.ConstantScoreQuery;
-import org.apache.lucene.search.DocValuesRangeQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.util.BytesRef;
@@ -234,8 +233,8 @@ public class EnumField extends PrimitiveFieldType {
    * {@inheritDoc}
    */
   @Override
-  public LegacyNumericType getNumericType() {
-    return LegacyNumericType.INT;
+  public NumberType getNumberType() {
+    return NumberType.INTEGER;
   }
 
   /**
@@ -253,10 +252,21 @@ public class EnumField extends PrimitiveFieldType {
     Query query = null;
     final boolean matchOnly = field.hasDocValues() && !field.indexed();
     if (matchOnly) {
-      query = new ConstantScoreQuery(DocValuesRangeQuery.newLongRange(field.getName(),
-              min == null ? null : minValue.longValue(),
-              max == null ? null : maxValue.longValue(),
-              minInclusive, maxInclusive));
+      long lowerValue = Long.MIN_VALUE;
+      long upperValue = Long.MAX_VALUE;
+      if (minValue != null) {
+        lowerValue = minValue.longValue();
+        if (minInclusive == false) {
+          ++lowerValue;
+        }
+      }
+      if (maxValue != null) {
+        upperValue = maxValue.longValue();
+        if (maxInclusive == false) {
+          --upperValue;
+        }
+      }
+      query = new ConstantScoreQuery(NumericDocValuesField.newRangeQuery(field.getName(), lowerValue, upperValue));
     } else {
       query = LegacyNumericRangeQuery.newIntRange(field.getName(), DEFAULT_PRECISION_STEP,
           min == null ? null : minValue,
@@ -265,13 +275,6 @@ public class EnumField extends PrimitiveFieldType {
     }
 
     return query;
-  }
-
-  /**
-   * {@inheritDoc}
-   */
-  @Override
-  public void checkSchemaField(SchemaField field) {
   }
 
   /**
@@ -372,7 +375,7 @@ public class EnumField extends PrimitiveFieldType {
    * {@inheritDoc}
    */
   @Override
-  public IndexableField createField(SchemaField field, Object value, float boost) {
+  public IndexableField createField(SchemaField field, Object value) {
     final boolean indexed = field.indexed();
     final boolean stored = field.stored();
     final boolean docValues = field.hasDocValues();
@@ -399,21 +402,17 @@ public class EnumField extends PrimitiveFieldType {
     newType.setNumericType(LegacyNumericType.INT);
     newType.setNumericPrecisionStep(DEFAULT_PRECISION_STEP);
 
-    final org.apache.lucene.document.Field f;
-    f = new LegacyIntField(field.getName(), intValue.intValue(), newType);
-
-    f.setBoost(boost);
-    return f;
+    return new LegacyIntField(field.getName(), intValue.intValue(), newType);
   }
 
   /**
    * {@inheritDoc}
    */
   @Override
-  public List<IndexableField> createFields(SchemaField sf, Object value, float boost) {
+  public List<IndexableField> createFields(SchemaField sf, Object value) {
     if (sf.hasDocValues()) {
       List<IndexableField> fields = new ArrayList<>();
-      final IndexableField field = createField(sf, value, boost);
+      final IndexableField field = createField(sf, value);
       fields.add(field);
 
       if (sf.multiValued()) {
@@ -426,7 +425,7 @@ public class EnumField extends PrimitiveFieldType {
       }
       return fields;
     } else {
-      return Collections.singletonList(createField(sf, value, boost));
+      return Collections.singletonList(createField(sf, value));
     }
   }
 

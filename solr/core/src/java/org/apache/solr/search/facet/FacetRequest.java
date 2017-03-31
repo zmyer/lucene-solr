@@ -16,6 +16,7 @@
  */
 package org.apache.solr.search.facet;
 
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,6 +36,7 @@ import org.apache.solr.search.QueryContext;
 import org.apache.solr.search.SolrIndexSearcher;
 import org.apache.solr.search.SyntaxError;
 
+import static org.apache.solr.common.params.CommonParams.SORT;
 import static org.apache.solr.search.facet.FacetRequest.RefineMethod.NONE;
 
 
@@ -77,7 +79,6 @@ public abstract class FacetRequest {
 
   protected Map<String,AggValueSource> facetStats;  // per-bucket statistics
   protected Map<String,FacetRequest> subFacets;     // per-bucket sub-facets
-  protected List<String> filters;
   protected boolean processEmpty;
   protected Domain domain;
 
@@ -86,7 +87,18 @@ public abstract class FacetRequest {
     public List<String> excludeTags;
     public boolean toParent;
     public boolean toChildren;
-    public String parents;
+    public String parents; // identifies the parent filter... the full set of parent documents for any block join operation
+    public List<Object> filters; // list of symbolic filters (JSON query format)
+
+    // True if a starting set of documents can be mapped onto a different set of documents not originally in the starting set.
+    public boolean canTransformDomain() {
+      return toParent || toChildren || excludeTags != null;
+    }
+
+    // Can this domain become non-empty if the input domain is empty?  This does not check any sub-facets (see canProduceFromEmpty for that)
+    public boolean canBecomeNonEmpty() {
+      return excludeTags != null;
+    }
   }
 
   public FacetRequest() {
@@ -115,6 +127,15 @@ public abstract class FacetRequest {
    * This is normally true only for facets with a limit.
    */
   public boolean returnsPartial() {
+    return false;
+  }
+
+  /** Returns true if this facet, or any sub-facets can produce results from an empty domain. */
+  public boolean canProduceFromEmpty() {
+    if (domain != null && domain.canBecomeNonEmpty()) return true;
+    for (FacetRequest freq : subFacets.values()) {
+      if (freq.canProduceFromEmpty()) return true;
+    }
     return false;
   }
 
@@ -148,7 +169,10 @@ public abstract class FacetRequest {
 class FacetContext {
   // Context info for actually executing a local facet command
   public static final int IS_SHARD=0x01;
+  public static final int IS_REFINEMENT=0x02;
+  public static final int SKIP_FACET=0x04;  // refinement: skip calculating this immediate facet, but proceed to specific sub-facets based on facetInfo
 
+  Map<String,Object> facetInfo; // refinement info for this node
   QueryContext qcontext;
   SolrQueryRequest req;  // TODO: replace with params?
   SolrIndexSearcher searcher;
@@ -358,23 +382,38 @@ abstract class FacetParser<FacetRequestT extends FacetRequest> {
 
       Map<String,Object> domainMap = (Map<String,Object>) m.get("domain");
       if (domainMap != null) {
+        FacetRequest.Domain domain = getDomain();
+
         excludeTags = getStringList(domainMap, "excludeTags");
         if (excludeTags != null) {
-          getDomain().excludeTags = excludeTags;
+          domain.excludeTags = excludeTags;
         }
 
         String blockParent = (String)domainMap.get("blockParent");
         String blockChildren = (String)domainMap.get("blockChildren");
 
         if (blockParent != null) {
-          getDomain().toParent = true;
-          getDomain().parents = blockParent;
+          domain.toParent = true;
+          domain.parents = blockParent;
         } else if (blockChildren != null) {
-          getDomain().toChildren = true;
-          getDomain().parents = blockChildren;
+          domain.toChildren = true;
+          domain.parents = blockChildren;
         }
 
-      }
+        Object filterOrList = domainMap.get("filter");
+        if (filterOrList != null) {
+          assert domain.filters == null;
+          if (filterOrList instanceof List) {
+            domain.filters = (List<Object>)filterOrList;
+          } else {
+            domain.filters = new ArrayList<>(1);
+            domain.filters.add(filterOrList);
+          }
+        }
+
+
+      } // end "domain"
+
 
     }
   }
@@ -533,6 +572,7 @@ class FacetQueryParser extends FacetParser<FacetQuery> {
 
     if (qstring != null) {
       QParser parser = QParser.getParser(qstring, getSolrRequest());
+      parser.setIsFilter(true);
       facet.q = parser.getQuery();
     }
 
@@ -586,6 +626,7 @@ class FacetFieldParser extends FacetParser<FacetField> {
       facet.field = getField(m);
       facet.offset = getLong(m, "offset", facet.offset);
       facet.limit = getLong(m, "limit", facet.limit);
+      facet.overrequest = (int) getLong(m, "overrequest", facet.overrequest);
       if (facet.limit == 0) facet.offset = 0;  // normalize.  an offset with a limit of non-zero isn't useful.
       facet.mincount = getLong(m, "mincount", facet.mincount);
       facet.missing = getBoolean(m, "missing", facet.missing);
@@ -605,7 +646,7 @@ class FacetFieldParser extends FacetParser<FacetField> {
       Object o = m.get("facet");
       parseSubs(o);
 
-      parseSort( m.get("sort") );
+      parseSort( m.get(SORT) );
     }
 
     return facet;

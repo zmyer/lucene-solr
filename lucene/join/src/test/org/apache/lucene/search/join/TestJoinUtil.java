@@ -267,7 +267,7 @@ public class TestJoinUtil extends LuceneTestCase {
       values[i] = DocValues.getSorted(leafReader, joinField);
     }
     MultiDocValues.OrdinalMap ordinalMap = MultiDocValues.OrdinalMap.build(
-        r.getCoreCacheKey(), values, PackedInts.DEFAULT
+        null, values, PackedInts.DEFAULT
     );
 
     Query toQuery = new TermQuery(new Term(typeField, "price"));
@@ -372,7 +372,7 @@ public class TestJoinUtil extends LuceneTestCase {
       values[i] = DocValues.getSorted(leafReader, joinField);
     }
     MultiDocValues.OrdinalMap ordinalMap = MultiDocValues.OrdinalMap.build(
-        r.getCoreCacheKey(), values, PackedInts.DEFAULT
+        null, values, PackedInts.DEFAULT
     );
 
     Query toQuery = new TermQuery(new Term("price", "5.0"));
@@ -454,59 +454,7 @@ public class TestJoinUtil extends LuceneTestCase {
 
   public void testMinMaxScore() throws Exception {
     String priceField = "price";
-    // FunctionQuery would be helpful, but join module doesn't depend on queries module.
-    Query priceQuery = new Query() {
-
-      private final Query fieldQuery = new FieldValueQuery(priceField);
-
-      @Override
-      public Weight createWeight(IndexSearcher searcher, boolean needsScores, float boost) throws IOException {
-        Weight fieldWeight = fieldQuery.createWeight(searcher, false, boost);
-        return new Weight(this) {
-
-          @Override
-          public void extractTerms(Set<Term> terms) {
-          }
-
-          @Override
-          public Explanation explain(LeafReaderContext context, int doc) throws IOException {
-            return null;
-          }
-
-          @Override
-          public Scorer scorer(LeafReaderContext context) throws IOException {
-            Scorer fieldScorer = fieldWeight.scorer(context);
-            if (fieldScorer == null) {
-              return null;
-            }
-            NumericDocValues price = context.reader().getNumericDocValues(priceField);
-            return new FilterScorer(fieldScorer, this) {
-              @Override
-              public float score() throws IOException {
-                assertEquals(in.docID(), price.nextDoc());
-                return (float) price.longValue();
-              }
-            };
-          }
-        };
-      }
-
-      @Override
-      public String toString(String field) {
-        return fieldQuery.toString(field);
-      }
-
-      @Override
-      public boolean equals(Object o) {
-        return o == this;
-      }
-
-      @Override
-      public int hashCode() {
-        return System.identityHashCode(this);
-      }
-
-    };
+    Query priceQuery = numericDocValuesScoreQuery(priceField);
 
     Directory dir = newDirectory();
     RandomIndexWriter iw = new RandomIndexWriter(
@@ -552,7 +500,7 @@ public class TestJoinUtil extends LuceneTestCase {
       values[leadContext.ord] = DocValues.getSorted(leadContext.reader(), "join_field");
     }
     MultiDocValues.OrdinalMap ordinalMap = MultiDocValues.OrdinalMap.build(
-        searcher.getIndexReader().getCoreCacheKey(), values, PackedInts.DEFAULT
+        null, values, PackedInts.DEFAULT
     );
     BooleanQuery.Builder fromQuery = new BooleanQuery.Builder();
     fromQuery.add(priceQuery, BooleanClause.Occur.MUST);
@@ -577,6 +525,62 @@ public class TestJoinUtil extends LuceneTestCase {
 
     searcher.getIndexReader().close();
     dir.close();
+  }
+
+  // FunctionQuery would be helpful, but join module doesn't depend on queries module.
+  static Query numericDocValuesScoreQuery(final String field) {
+    return new Query() {
+
+        private final Query fieldQuery = new FieldValueQuery(field);
+
+        @Override
+        public Weight createWeight(IndexSearcher searcher, boolean needsScores, float boost) throws IOException {
+          Weight fieldWeight = fieldQuery.createWeight(searcher, false, boost);
+          return new Weight(this) {
+
+            @Override
+            public void extractTerms(Set<Term> terms) {
+            }
+
+            @Override
+            public Explanation explain(LeafReaderContext context, int doc) throws IOException {
+              return null;
+            }
+
+            @Override
+            public Scorer scorer(LeafReaderContext context) throws IOException {
+              Scorer fieldScorer = fieldWeight.scorer(context);
+              if (fieldScorer == null) {
+                return null;
+              }
+              NumericDocValues price = context.reader().getNumericDocValues(field);
+              return new FilterScorer(fieldScorer, this) {
+                @Override
+                public float score() throws IOException {
+                  assertEquals(in.docID(), price.advance(in.docID()));
+                  return (float) price.longValue();
+                }
+              };
+            }
+          };
+        }
+
+        @Override
+        public String toString(String field) {
+          return fieldQuery.toString(field);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+          return o == this;
+        }
+
+        @Override
+        public int hashCode() {
+          return System.identityHashCode(this);
+        }
+
+      };
   }
 
   public void testMinMaxDocs() throws Exception {
@@ -617,7 +621,7 @@ public class TestJoinUtil extends LuceneTestCase {
       values[leadContext.ord] = DocValues.getSorted(leadContext.reader(), "join_field");
     }
     MultiDocValues.OrdinalMap ordinalMap = MultiDocValues.OrdinalMap.build(
-        searcher.getIndexReader().getCoreCacheKey(), values, PackedInts.DEFAULT
+        null, values, PackedInts.DEFAULT
     );
     Query fromQuery = new TermQuery(new Term("type", "from"));
     Query toQuery = new TermQuery(new Term("type", "to"));
@@ -1332,7 +1336,7 @@ public class TestJoinUtil extends LuceneTestCase {
         values[leadContext.ord] = DocValues.getSorted(leadContext.reader(), "join_field");
       }
       context.ordinalMap = MultiDocValues.OrdinalMap.build(
-          topLevelReader.getCoreCacheKey(), values, PackedInts.DEFAULT
+          null, values, PackedInts.DEFAULT
       );
     }
 

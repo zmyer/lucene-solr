@@ -20,69 +20,46 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.google.common.collect.Iterables;
 import org.apache.lucene.document.Document;
-import org.apache.lucene.document.DocumentStoredFieldVisitor;
-import org.apache.lucene.document.LazyDocument;
-import org.apache.lucene.index.*;
-import org.apache.lucene.index.StoredFieldVisitor.Status;
-import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.ExitableDirectoryReader;
+import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.MultiPostingsEnum;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermContext;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.*;
 import org.apache.lucene.search.BooleanClause.Occur;
-import org.apache.lucene.search.BooleanQuery;
-import org.apache.lucene.search.CollectionStatistics;
-import org.apache.lucene.search.Collector;
-import org.apache.lucene.search.ConstantScoreQuery;
-import org.apache.lucene.search.DocIdSet;
-import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.EarlyTerminatingSortingCollector;
-import org.apache.lucene.search.Explanation;
-import org.apache.lucene.search.FieldDoc;
-import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.LeafCollector;
-import org.apache.lucene.search.MatchAllDocsQuery;
-import org.apache.lucene.search.MultiCollector;
-import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreDoc;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.SimpleCollector;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
-import org.apache.lucene.search.TermQuery;
-import org.apache.lucene.search.TermStatistics;
-import org.apache.lucene.search.TimeLimitingCollector;
-import org.apache.lucene.search.TopDocs;
-import org.apache.lucene.search.TopDocsCollector;
-import org.apache.lucene.search.TopFieldCollector;
-import org.apache.lucene.search.TopFieldDocs;
-import org.apache.lucene.search.TopScoreDocCollector;
-import org.apache.lucene.search.TotalHitCountCollector;
-import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
-import org.apache.solr.common.SolrDocumentBase;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrException.ErrorCode;
 import org.apache.solr.common.params.ModifiableSolrParams;
 import org.apache.solr.common.util.NamedList;
+import org.apache.solr.common.util.ObjectReleaseTracker;
 import org.apache.solr.common.util.SimpleOrderedMap;
 import org.apache.solr.core.DirectoryFactory;
 import org.apache.solr.core.DirectoryFactory.DirContext;
@@ -94,14 +71,8 @@ import org.apache.solr.request.LocalSolrQueryRequest;
 import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.request.SolrRequestInfo;
 import org.apache.solr.response.SolrQueryResponse;
-import org.apache.solr.schema.BoolField;
-import org.apache.solr.schema.EnumField;
 import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
-import org.apache.solr.schema.TrieDateField;
-import org.apache.solr.schema.TrieDoubleField;
-import org.apache.solr.schema.TrieFloatField;
-import org.apache.solr.schema.TrieIntField;
 import org.apache.solr.search.facet.UnInvertedField;
 import org.apache.solr.search.stats.StatsSource;
 import org.apache.solr.uninverting.UninvertingReader;
@@ -109,10 +80,6 @@ import org.apache.solr.update.IndexFingerprint;
 import org.apache.solr.update.SolrIndexConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.base.Function;
-import com.google.common.base.Objects;
-import com.google.common.collect.Iterables;
 
 /**
  * SolrIndexSearcher adds schema awareness and caching functionality over {@link IndexSearcher}.
@@ -133,6 +100,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
   private final SolrCore core;
   private final IndexSchema schema;
+  private final SolrDocumentFetcher docFetcher;
 
   private final String name;
   private final Date openTime = new Date();
@@ -145,12 +113,10 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   private final int queryResultWindowSize;
   private final int queryResultMaxDocsCached;
   private final boolean useFilterForSortedQuery;
-  public final boolean enableLazyFieldLoading;
 
   private final boolean cachingEnabled;
   private final SolrCache<Query,DocSet> filterCache;
   private final SolrCache<QueryResultKey,DocList> queryResultCache;
-  private final SolrCache<Integer,Document> documentCache;
   private final SolrCache<String,UnInvertedField> fieldValueCache;
 
   // map of generic caches - not synchronized since it's read-only after the constructor.
@@ -161,16 +127,6 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
   private final FieldInfos fieldInfos;
 
-  /** Contains the names/patterns of all docValues=true,stored=false fields in the schema. */
-  private final Set<String> allNonStoredDVs;
-
-  /** Contains the names/patterns of all docValues=true,stored=false,useDocValuesAsStored=true fields in the schema. */
-  private final Set<String> nonStoredDVsUsedAsStored;
-
-  /** Contains the names/patterns of all docValues=true,stored=false fields, excluding those that are copyField targets in the schema. */
-  private final Set<String> nonStoredDVsWithoutCopyTargets;
-
-  private Collection<String> storedHighlightFieldNames;
   private DirectoryFactory directoryFactory;
 
   private final LeafReader leafReader;
@@ -183,7 +139,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   private final NamedList<Object> readerStats;
 
   private static DirectoryReader getReader(SolrCore core, SolrIndexConfig config, DirectoryFactory directoryFactory,
-      String path) throws IOException {
+                                           String path) throws IOException {
     final Directory dir = directoryFactory.get(path, DirContext.DEFAULT, config.lockType);
     try {
       return core.getIndexReaderFactory().newReader(dir, core);
@@ -303,7 +259,9 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
     this.queryResultWindowSize = solrConfig.queryResultWindowSize;
     this.queryResultMaxDocsCached = solrConfig.queryResultMaxDocsCached;
     this.useFilterForSortedQuery = solrConfig.useFilterForSortedQuery;
-    this.enableLazyFieldLoading = solrConfig.enableLazyFieldLoading;
+
+    this.fieldInfos = leafReader.getFieldInfos();
+    this.docFetcher = new SolrDocumentFetcher(this, solrConfig, enableCache);
 
     this.cachingEnabled = enableCache;
     if (cachingEnabled) {
@@ -316,7 +274,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
       queryResultCache = solrConfig.queryResultCacheConfig == null ? null
           : solrConfig.queryResultCacheConfig.newInstance();
       if (queryResultCache != null) clist.add(queryResultCache);
-      documentCache = solrConfig.documentCacheConfig == null ? null : solrConfig.documentCacheConfig.newInstance();
+      SolrCache<Integer, Document> documentCache = docFetcher.getDocumentCache();
       if (documentCache != null) clist.add(documentCache);
 
       if (solrConfig.userCacheConfigs.isEmpty()) {
@@ -336,33 +294,10 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
     } else {
       this.filterCache = null;
       this.queryResultCache = null;
-      this.documentCache = null;
       this.fieldValueCache = null;
       this.cacheMap = NO_GENERIC_CACHES;
       this.cacheList = NO_CACHES;
     }
-
-    final Set<String> nonStoredDVsUsedAsStored = new HashSet<>();
-    final Set<String> allNonStoredDVs = new HashSet<>();
-    final Set<String> nonStoredDVsWithoutCopyTargets = new HashSet<>();
-
-    this.fieldInfos = leafReader.getFieldInfos();
-    for (FieldInfo fieldInfo : fieldInfos) {
-      final SchemaField schemaField = schema.getFieldOrNull(fieldInfo.name);
-      if (schemaField != null && !schemaField.stored() && schemaField.hasDocValues()) {
-        if (schemaField.useDocValuesAsStored()) {
-          nonStoredDVsUsedAsStored.add(fieldInfo.name);
-        }
-        allNonStoredDVs.add(fieldInfo.name);
-        if (!schema.isCopyFieldTarget(schemaField)) {
-          nonStoredDVsWithoutCopyTargets.add(fieldInfo.name);
-        }
-      }
-    }
-
-    this.nonStoredDVsUsedAsStored = Collections.unmodifiableSet(nonStoredDVsUsedAsStored);
-    this.allNonStoredDVs = Collections.unmodifiableSet(allNonStoredDVs);
-    this.nonStoredDVsWithoutCopyTargets = Collections.unmodifiableSet(nonStoredDVsWithoutCopyTargets);
 
     // We already have our own filter cache
     setQueryCache(null);
@@ -370,11 +305,24 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
     readerStats = snapStatistics(reader);
     // do this at the end since an exception in the constructor means we won't close
     numOpens.incrementAndGet();
+    assert ObjectReleaseTracker.track(this);
+  }
+
+  public SolrDocumentFetcher getDocFetcher() {
+    return docFetcher;
+  }
+
+  List<LeafReaderContext> getLeafContexts() {
+    return super.leafContexts;
+  }
+
+  public FieldInfos getFieldInfos() {
+    return fieldInfos;
   }
 
   /*
-   * Override these two methods to provide a way to use global collection stats.
-   */
+     * Override these two methods to provide a way to use global collection stats.
+     */
   @Override
   public TermStatistics termStatistics(Term term, TermContext context) throws IOException {
     final SolrRequestInfo reqInfo = SolrRequestInfo.getRequestInfo();
@@ -426,6 +374,10 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
   public final int maxDoc() {
     return reader.maxDoc();
+  }
+
+  public final int numDocs() {
+    return reader.numDocs();
   }
 
   public final int docFreq(Term term) throws IOException {
@@ -514,6 +466,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
     // do this at the end so it only gets done if there are no exceptions
     numCloses.incrementAndGet();
+    assert ObjectReleaseTracker.release(this);
   }
 
   /** Direct access to the IndexSchema for use with this searcher */
@@ -525,40 +478,11 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
    * Returns a collection of all field names the index reader knows about.
    */
   public Iterable<String> getFieldNames() {
-    return Iterables.transform(fieldInfos, new Function<FieldInfo,String>() {
-      @Override
-      public String apply(FieldInfo fieldInfo) {
-        return fieldInfo.name;
-      }
-    });
+    return Iterables.transform(fieldInfos, fieldInfo -> fieldInfo.name);
   }
 
   public SolrCache<Query,DocSet> getFilterCache() {
     return filterCache;
-  }
-
-  /**
-   * Returns a collection of the names of all stored fields which can be highlighted the index reader knows about.
-   */
-  public Collection<String> getStoredHighlightFieldNames() {
-    synchronized (this) {
-      if (storedHighlightFieldNames == null) {
-        storedHighlightFieldNames = new LinkedList<>();
-        for (FieldInfo fieldInfo : fieldInfos) {
-          final String fieldName = fieldInfo.name;
-          try {
-            SchemaField field = schema.getField(fieldName);
-            if (field.stored() && ((field.getType() instanceof org.apache.solr.schema.TextField)
-                || (field.getType() instanceof org.apache.solr.schema.StrField))) {
-              storedHighlightFieldNames.add(fieldName);
-            }
-          } catch (RuntimeException e) { // getField() throws a SolrException, but it arrives as a RuntimeException
-            log.warn("Field [{}] found in index, but not defined in schema.", fieldName);
-          }
-        }
-      }
-      return storedHighlightFieldNames;
-    }
   }
 
   //
@@ -649,91 +573,26 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   // }
   // }
 
-  /* ********************** Document retrieval *************************/
-
-  /*
-   * Future optimizations (yonik)
-   *
-   * If no cache is present: - use NO_LOAD instead of LAZY_LOAD - use LOAD_AND_BREAK if a single field is begin
-   * retrieved
-   */
-
-  /** FieldSelector which loads the specified fields, and loads all other field lazily. */
-  private static class SetNonLazyFieldSelector extends DocumentStoredFieldVisitor {
-    private final Document doc;
-    private final LazyDocument lazyDoc;
-
-    SetNonLazyFieldSelector(Set<String> toLoad, IndexReader reader, int docID) {
-      super(toLoad);
-      lazyDoc = new LazyDocument(reader, docID);
-      doc = getDocument();
-    }
-
-    @Override
-    public Status needsField(FieldInfo fieldInfo) throws IOException {
-      Status status = super.needsField(fieldInfo);
-      if (status == Status.NO) {
-        doc.add(lazyDoc.getField(fieldInfo));
-      }
-      return status;
-    }
-  }
-
   /**
    * Retrieve the {@link Document} instance corresponding to the document id.
+   *
+   * @see SolrDocumentFetcher
    */
   @Override
-  public Document doc(int i) throws IOException {
-    return doc(i, (Set<String>) null);
+  public Document doc(int docId) throws IOException {
+    return doc(docId, (Set<String>) null);
   }
 
   /**
-   * Visit a document's fields using a {@link StoredFieldVisitor} This method does not currently add to the Solr
-   * document cache.
+   * Visit a document's fields using a {@link StoredFieldVisitor}.
+   * This method does not currently add to the Solr document cache.
    * 
    * @see IndexReader#document(int, StoredFieldVisitor)
+   * @see SolrDocumentFetcher
    */
   @Override
-  public void doc(int n, StoredFieldVisitor visitor) throws IOException {
-    if (documentCache != null) {
-      Document cached = documentCache.get(n);
-      if (cached != null) {
-        visitFromCached(cached, visitor);
-        return;
-      }
-    }
-    getIndexReader().document(n, visitor);
-  }
-
-  /** Executes a stored field visitor against a hit from the document cache */
-  private void visitFromCached(Document document, StoredFieldVisitor visitor) throws IOException {
-    for (IndexableField f : document) {
-      final FieldInfo info = fieldInfos.fieldInfo(f.name());
-      final Status needsField = visitor.needsField(info);
-      if (needsField == Status.STOP) return;
-      if (needsField == Status.NO) continue;
-      if (f.binaryValue() != null) {
-        final BytesRef binaryValue = f.binaryValue();
-        final byte copy[] = new byte[binaryValue.length];
-        System.arraycopy(binaryValue.bytes, binaryValue.offset, copy, 0, copy.length);
-        visitor.binaryField(info, copy);
-      } else if (f.numericValue() != null) {
-        final Number numericValue = f.numericValue();
-        if (numericValue instanceof Double) {
-          visitor.doubleField(info, numericValue.doubleValue());
-        } else if (numericValue instanceof Integer) {
-          visitor.intField(info, numericValue.intValue());
-        } else if (numericValue instanceof Float) {
-          visitor.floatField(info, numericValue.floatValue());
-        } else if (numericValue instanceof Long) {
-          visitor.longField(info, numericValue.longValue());
-        } else {
-          throw new AssertionError();
-        }
-      } else {
-        visitor.stringField(info, f.stringValue().getBytes(StandardCharsets.UTF_8));
-      }
-    }
+  public final void doc(int docId, StoredFieldVisitor visitor) throws IOException {
+    getDocFetcher().doc(docId, visitor);
   }
 
   /**
@@ -741,184 +600,13 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
    * <p>
    * <b>NOTE</b>: the document will have all fields accessible, but if a field filter is provided, only the provided
    * fields will be loaded (the remainder will be available lazily).
+   *
+   * @see SolrDocumentFetcher
    */
   @Override
-  public Document doc(int i, Set<String> fields) throws IOException {
-
-    Document d;
-    if (documentCache != null) {
-      d = documentCache.get(i);
-      if (d != null) return d;
-    }
-
-    final DirectoryReader reader = getIndexReader();
-    if (fields != null) {
-      if (enableLazyFieldLoading) {
-        final SetNonLazyFieldSelector visitor = new SetNonLazyFieldSelector(fields, reader, i);
-        reader.document(i, visitor);
-        d = visitor.doc;
-      } else if (documentCache == null) {
-        d = reader.document(i, fields);
-      } else {
-        // we do not pass the fields in this case because that would return an incomplete document which would
-        // be eventually cached. The alternative would be to read the stored fields twice; once with the fields
-        // and then without for caching leading to a performance hit
-        // see SOLR-8858 for related discussion
-        d = reader.document(i);
-      }
-    } else {
-      d = reader.document(i);
-    }
-
-    if (documentCache != null) {
-      documentCache.put(i, d);
-    }
-
-    return d;
+  public final Document doc(int i, Set<String> fields) throws IOException {
+    return getDocFetcher().doc(i, fields);
   }
-
-  /**
-   * This will fetch and add the docValues fields to a given SolrDocument/SolrInputDocument
-   *
-   * @param doc
-   *          A SolrDocument or SolrInputDocument instance where docValues will be added
-   * @param docid
-   *          The lucene docid of the document to be populated
-   * @param fields
-   *          The list of docValues fields to be decorated
-   */
-  public void decorateDocValueFields(@SuppressWarnings("rawtypes") SolrDocumentBase doc, int docid, Set<String> fields)
-      throws IOException {
-    final int subIndex = ReaderUtil.subIndex(docid, leafContexts);
-    final int localId = docid - leafContexts.get(subIndex).docBase;
-    final LeafReader leafReader = leafContexts.get(subIndex).reader();
-    for (String fieldName : fields) {
-      final SchemaField schemaField = schema.getFieldOrNull(fieldName);
-      if (schemaField == null || !schemaField.hasDocValues() || doc.containsKey(fieldName)) {
-        log.warn("Couldn't decorate docValues for field: [{}], schemaField: [{}]", fieldName, schemaField);
-        continue;
-      }
-
-      if (schemaField.multiValued()) {
-        final SortedSetDocValues values = leafReader.getSortedSetDocValues(fieldName);
-        if (values != null && values.getValueCount() > 0) {
-          if (values.advance(localId) == localId) {
-            final List<Object> outValues = new LinkedList<Object>();
-            for (long ord = values.nextOrd(); ord != SortedSetDocValues.NO_MORE_ORDS; ord = values.nextOrd()) {
-              final BytesRef value = values.lookupOrd(ord);
-              outValues.add(schemaField.getType().toObject(schemaField, value));
-            }
-            assert outValues.size() > 0;
-            doc.addField(fieldName, outValues);
-          }
-        }
-      } else {
-        final DocValuesType dvType = fieldInfos.fieldInfo(fieldName).getDocValuesType();
-        switch (dvType) {
-          case NUMERIC:
-            final NumericDocValues ndv = leafReader.getNumericDocValues(fieldName);
-            if (ndv == null) {
-              continue;
-            }
-            Long val;
-            if (ndv.advanceExact(localId)) {
-              val = ndv.longValue();
-            } else {
-              continue;
-            }
-            Object newVal = val;
-            if (schemaField.getType() instanceof TrieIntField) {
-              newVal = val.intValue();
-            } else if (schemaField.getType() instanceof TrieFloatField) {
-              newVal = Float.intBitsToFloat(val.intValue());
-            } else if (schemaField.getType() instanceof TrieDoubleField) {
-              newVal = Double.longBitsToDouble(val);
-            } else if (schemaField.getType() instanceof TrieDateField) {
-              newVal = new Date(val);
-            } else if (schemaField.getType() instanceof EnumField) {
-              newVal = ((EnumField) schemaField.getType()).intValueToStringValue(val.intValue());
-            }
-            doc.addField(fieldName, newVal);
-            break;
-          case BINARY:
-            BinaryDocValues bdv = leafReader.getBinaryDocValues(fieldName);
-            if (bdv == null) {
-              continue;
-            }
-            BytesRef value;
-            if (bdv.advanceExact(localId)) {
-              value = BytesRef.deepCopyOf(bdv.binaryValue());
-            } else {
-              continue;
-            }
-            doc.addField(fieldName, value);
-            break;
-          case SORTED:
-            SortedDocValues sdv = leafReader.getSortedDocValues(fieldName);
-            if (sdv == null) {
-              continue;
-            }
-            if (sdv.advanceExact(localId)) {
-              final BytesRef bRef = sdv.binaryValue();
-              // Special handling for Boolean fields since they're stored as 'T' and 'F'.
-              if (schemaField.getType() instanceof BoolField) {
-                doc.addField(fieldName, schemaField.getType().toObject(schemaField, bRef));
-              } else {
-                doc.addField(fieldName, bRef.utf8ToString());
-              }
-            }
-            break;
-          case SORTED_NUMERIC:
-            throw new AssertionError("SORTED_NUMERIC not supported yet!");
-          case SORTED_SET:
-            throw new AssertionError("SORTED_SET fields should be multi-valued!");
-          case NONE:
-            break;
-        }
-      }
-    }
-  }
-
-  /**
-   * Takes a list of docs (the doc ids actually), and reads them into an array of Documents.
-   */
-  public void readDocs(Document[] docs, DocList ids) throws IOException {
-    readDocs(docs, ids, null);
-  }
-
-  /**
-   * Takes a list of docs (the doc ids actually) and a set of fields to load, and reads them into an array of Documents.
-   */
-  public void readDocs(Document[] docs, DocList ids, Set<String> fields) throws IOException {
-    final DocIterator iter = ids.iterator();
-    for (int i = 0; i < docs.length; i++) {
-      docs[i] = doc(iter.nextDoc(), fields);
-    }
-  }
-
-  /**
-   * Returns an unmodifiable set of non-stored docValues field names.
-   *
-   * @param onlyUseDocValuesAsStored
-   *          If false, returns all non-stored docValues. If true, returns only those non-stored docValues which have
-   *          the {@link SchemaField#useDocValuesAsStored()} flag true.
-   */
-  public Set<String> getNonStoredDVs(boolean onlyUseDocValuesAsStored) {
-    return onlyUseDocValuesAsStored ? nonStoredDVsUsedAsStored : allNonStoredDVs;
-  }
-
-  /**
-   * Returns an unmodifiable set of names of non-stored docValues fields, except those that are targets of a copy field.
-   */
-  public Set<String> getNonStoredDVsWithoutCopyTargets() {
-    return nonStoredDVsWithoutCopyTargets;
-  }
-
-  /* ********************** end document retrieval *************************/
-
-  ////////////////////////////////////////////////////////////////////////////////
-  ////////////////////////////////////////////////////////////////////////////////
-  ////////////////////////////////////////////////////////////////////////////////
 
   /** expert: internal API, subject to change */
   public SolrCache<String,UnInvertedField> getFieldValueCache() {
@@ -928,6 +616,32 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   /** Returns a weighted sort according to this searcher */
   public Sort weightSort(Sort sort) throws IOException {
     return (sort != null) ? sort.rewrite(this) : null;
+  }
+
+  /** Returns a weighted sort spec according to this searcher */
+  public SortSpec weightSortSpec(SortSpec originalSortSpec, Sort nullEquivalent) throws IOException {
+    return implWeightSortSpec(
+        originalSortSpec.getSort(),
+        originalSortSpec.getCount(),
+        originalSortSpec.getOffset(),
+        nullEquivalent);
+  }
+
+  /** Returns a weighted sort spec according to this searcher */
+  private SortSpec implWeightSortSpec(Sort originalSort, int num, int offset, Sort nullEquivalent) throws IOException {
+    Sort rewrittenSort = weightSort(originalSort);
+    if (rewrittenSort == null) {
+      rewrittenSort = nullEquivalent;
+    }
+
+    final SortField[] rewrittenSortFields = rewrittenSort.getSort();
+    final SchemaField[] rewrittenSchemaFields = new SchemaField[rewrittenSortFields.length];
+    for (int ii = 0; ii < rewrittenSortFields.length; ++ii) {
+      final String fieldName = rewrittenSortFields[ii].getField();
+      rewrittenSchemaFields[ii] = (fieldName == null ? null : schema.getFieldOrNull(fieldName));
+    }
+
+    return new SortSpec(rewrittenSort, rewrittenSchemaFields, num, offset);
   }
 
   /**
@@ -1014,19 +728,24 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
     getDocSet(query);
   }
 
-  public BitDocSet getDocSetBits(Query q) throws IOException {
-    DocSet answer = getDocSet(q);
-    if (answer instanceof BitDocSet) {
-      return (BitDocSet) answer;
-    }
-
+  private BitDocSet makeBitDocSet(DocSet answer) {
+    // TODO: this should be implemented in DocSet, most likely with a getBits method that takes a maxDoc argument
+    // or make DocSet instances remember maxDoc
     FixedBitSet bs = new FixedBitSet(maxDoc());
     DocIterator iter = answer.iterator();
     while (iter.hasNext()) {
       bs.set(iter.nextDoc());
     }
 
-    BitDocSet answerBits = new BitDocSet(bs, answer.size());
+    return new BitDocSet(bs, answer.size());
+  }
+
+  public BitDocSet getDocSetBits(Query q) throws IOException {
+    DocSet answer = getDocSet(q);
+    if (answer instanceof BitDocSet) {
+      return (BitDocSet) answer;
+    }
+    BitDocSet answerBits = makeBitDocSet(answer);
     if (filterCache != null) {
       filterCache.put(q, answerBits);
     }
@@ -1089,14 +808,34 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   }
 
   private static Query matchAllDocsQuery = new MatchAllDocsQuery();
-  private BitDocSet liveDocs;
+  private volatile BitDocSet liveDocs;
 
+  /** @lucene.internal the type of DocSet returned may change in the future */
   public BitDocSet getLiveDocs() throws IOException {
-    // going through the filter cache will provide thread safety here
-    if (liveDocs == null) {
-      liveDocs = getDocSetBits(matchAllDocsQuery);
+    // Going through the filter cache will provide thread safety here if we only had getLiveDocs,
+    // but the addition of setLiveDocs means we needed to add volatile to "liveDocs".
+    BitDocSet docs = liveDocs;
+    if (docs == null) {
+      liveDocs = docs = getDocSetBits(matchAllDocsQuery);
     }
-    return liveDocs;
+    assert docs.size() == numDocs();
+    return docs;
+  }
+
+  /** @lucene.internal */
+  public boolean isLiveDocsInstantiated() {
+    return liveDocs != null;
+  }
+
+  /** @lucene.internal */
+  public void setLiveDocs(DocSet docs) {
+    // a few places currently expect BitDocSet
+    assert docs.size() == numDocs();
+    if (docs instanceof BitDocSet) {
+      this.liveDocs = (BitDocSet)docs;
+    } else {
+      this.liveDocs = makeBitDocSet(docs);
+    }
   }
 
   public static class ProcessedFilter {
@@ -1129,8 +868,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
       ((DelegatingCollector) collector).finish();
     }
 
-    DocSet docSet = setCollector.getDocSet();
-    return docSet;
+    return DocSetUtil.getDocSet(setCollector, this);
   }
 
   /**
@@ -1202,7 +940,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
       ((DelegatingCollector) collector).finish();
     }
 
-    return setCollector.getDocSet();
+    return DocSetUtil.getDocSet(setCollector, this);
   }
 
   public ProcessedFilter getProcessedFilter(DocSet setFilter, List<Query> queries) throws IOException {
@@ -1910,7 +1648,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
       buildAndRunCollectorChain(qr, query, collector, cmd, pf.postFilter);
 
-      set = setCollector.getDocSet();
+      set = DocSetUtil.getDocSet(setCollector, this);
 
       nDocsReturned = 0;
       ids = new int[nDocsReturned];
@@ -1927,7 +1665,7 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
 
       buildAndRunCollectorChain(qr, query, collector, cmd, pf.postFilter);
 
-      set = setCollector.getDocSet();
+      set = DocSetUtil.getDocSet(setCollector, this);
 
       totalHits = topCollector.getTotalHits();
       assert (totalHits == set.size());
@@ -2346,15 +2084,6 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
   }
 
   /**
-   * Takes a list of document IDs, and returns an array of Documents containing all of the stored fields.
-   */
-  public Document[] readDocs(DocList ids) throws IOException {
-    final Document[] docs = new Document[ids.size()];
-    readDocs(docs, ids);
-    return docs;
-  }
-
-  /**
    * Warm this searcher based on an old one (primarily for auto-cache warming).
    */
   public void warm(SolrIndexSearcher old) {
@@ -2674,8 +2403,8 @@ public class SolrIndexSearcher extends IndexSearcher implements Closeable, SolrI
     }
 
     private boolean equalsTo(FilterImpl other) {
-      return Objects.equal(this.topFilter, other.topFilter) &&
-             Objects.equal(this.weights, other.weights);
+      return Objects.equals(this.topFilter, other.topFilter) &&
+             Objects.equals(this.weights, other.weights);
     }
 
     @Override

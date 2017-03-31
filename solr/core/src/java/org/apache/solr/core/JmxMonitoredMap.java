@@ -20,6 +20,7 @@ import javax.management.Attribute;
 import javax.management.AttributeList;
 import javax.management.AttributeNotFoundException;
 import javax.management.DynamicMBean;
+import javax.management.InstanceNotFoundException;
 import javax.management.InvalidAttributeValueException;
 import javax.management.MBeanAttributeInfo;
 import javax.management.MBeanException;
@@ -37,7 +38,6 @@ import javax.management.openmbean.SimpleType;
 import javax.management.remote.JMXConnectorServer;
 import javax.management.remote.JMXConnectorServerFactory;
 import javax.management.remote.JMXServiceURL;
-
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -53,9 +53,11 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.core.SolrConfig.JmxConfiguration;
+import org.apache.solr.metrics.reporters.JmxObjectNameFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.solr.common.params.CommonParams.ID;
 import static org.apache.solr.common.params.CommonParams.NAME;
 
 /**
@@ -75,19 +77,26 @@ public class JmxMonitoredMap<K, V> extends
         ConcurrentHashMap<String, SolrInfoMBean> {
   private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
+  private static final String REPORTER_NAME = "_jmx_";
+
   // set to true to use cached statistics NamedLists between getMBeanInfo calls to work
   // around over calling getStatistics on MBeanInfos when iterating over all attributes (SOLR-6586)
-  private boolean useCachedStatsBetweenGetMBeanInfoCalls = Boolean.getBoolean("useCachedStatsBetweenGetMBeanInfoCalls");
+  private final boolean useCachedStatsBetweenGetMBeanInfoCalls = Boolean.getBoolean("useCachedStatsBetweenGetMBeanInfoCalls");
   
-  private MBeanServer server = null;
+  private final MBeanServer server;
 
-  private String jmxRootName;
+  private final String jmxRootName;
 
-  private String coreHashCode;
+  private final String coreHashCode;
 
-  public JmxMonitoredMap(String coreName, String coreHashCode,
+  private final JmxObjectNameFactory nameFactory;
+
+  private final String registryName;
+
+  public JmxMonitoredMap(String coreName, String coreHashCode, String registryName,
                          final JmxConfiguration jmxConfig) {
     this.coreHashCode = coreHashCode;
+    this.registryName = registryName;
     jmxRootName = (null != jmxConfig.rootName ?
                    jmxConfig.rootName
                    : ("solr" + (null != coreName ? "/" + coreName : "")));
@@ -108,6 +117,8 @@ public class JmxMonitoredMap<K, V> extends
       }
 
       if (servers == null || servers.isEmpty()) {
+        server = null;
+        nameFactory = null;
         log.debug("No JMX servers found, not exposing Solr information with JMX.");
         return;
       }
@@ -115,20 +126,22 @@ public class JmxMonitoredMap<K, V> extends
       log.info("JMX monitoring is enabled. Adding Solr mbeans to JMX Server: "
                + server);
     } else {
+      MBeanServer newServer = null;
       try {
         // Create a new MBeanServer with the given serviceUrl
-        server = MBeanServerFactory.newMBeanServer();
+        newServer = MBeanServerFactory.newMBeanServer();
         JMXConnectorServer connector = JMXConnectorServerFactory
                 .newJMXConnectorServer(new JMXServiceURL(jmxConfig.serviceUrl),
-                        null, server);
+                        null, newServer);
         connector.start();
         log.info("JMX monitoring is enabled at " + jmxConfig.serviceUrl);
       } catch (Exception e) {
         // Release the reference
-        server = null;
         throw new RuntimeException("Could not start JMX monitoring ", e);
       }
+      server = newServer;
     }
+    nameFactory = new JmxObjectNameFactory(REPORTER_NAME + coreHashCode, registryName);
   }
 
   /**
@@ -138,12 +151,12 @@ public class JmxMonitoredMap<K, V> extends
   @Override
   public void clear() {
     if (server != null) {
-      QueryExp exp = Query.eq(Query.attr("coreHashCode"), Query.value(coreHashCode));
+      QueryExp exp = Query.or(Query.eq(Query.attr("coreHashCode"), Query.value(coreHashCode)),
+                            Query.eq(Query.attr("reporter"), Query.value(REPORTER_NAME + coreHashCode)));
       
       Set<ObjectName> objectNames = null;
       try {
-        ObjectName instance = new ObjectName(jmxRootName + ":*");
-        objectNames = server.queryNames(instance, exp);
+        objectNames = server.queryNames(null, exp);
       } catch (Exception e) {
         log.warn("Exception querying for mbeans", e);
       }
@@ -152,6 +165,8 @@ public class JmxMonitoredMap<K, V> extends
         for (ObjectName name : objectNames) {
           try {
             server.unregisterMBean(name);
+          } catch (InstanceNotFoundException ie) {
+            // ignore - someone else already deleted this one
           } catch (Exception e) {
             log.warn("Exception un-registering mbean {}", name, e);
           }
@@ -175,17 +190,37 @@ public class JmxMonitoredMap<K, V> extends
   public SolrInfoMBean put(String key, SolrInfoMBean infoBean) {
     if (server != null && infoBean != null) {
       try {
+        // back-compat name
         ObjectName name = getObjectName(key, infoBean);
         if (server.isRegistered(name))
           server.unregisterMBean(name);
         SolrDynamicMBean mbean = new SolrDynamicMBean(coreHashCode, infoBean, useCachedStatsBetweenGetMBeanInfoCalls);
         server.registerMBean(mbean, name);
+        // now register it also under new name
+        String beanName = createBeanName(infoBean, key);
+        name = nameFactory.createName(null, registryName, beanName);
+        if (server.isRegistered(name))
+          server.unregisterMBean(name);
+        server.registerMBean(mbean, name);
       } catch (Exception e) {
-        log.warn( "Failed to register info bean: " + key, e);
+        log.warn( "Failed to register info bean: key=" + key + ", infoBean=" + infoBean, e);
       }
     }
 
     return super.put(key, infoBean);
+  }
+
+  private String createBeanName(SolrInfoMBean infoBean, String key) {
+    if (infoBean.getCategory() == null) {
+      throw new IllegalArgumentException("SolrInfoMBean.category must never be null: " + infoBean);
+    }
+    StringBuilder sb = new StringBuilder();
+    sb.append(infoBean.getCategory().toString());
+    sb.append('.');
+    sb.append(key);
+    sb.append('.');
+    sb.append(infoBean.getName());
+    return sb.toString();
   }
 
   /**
@@ -212,8 +247,15 @@ public class JmxMonitoredMap<K, V> extends
       return;
 
     try {
+      // remove legacy name
       ObjectName name = getObjectName(key, infoBean);
       if (server.isRegistered(name) && coreHashCode.equals(server.getAttribute(name, "coreHashCode"))) {
+        server.unregisterMBean(name);
+      }
+      // remove new name
+      String beanName = createBeanName(infoBean, key);
+      name = nameFactory.createName(null, registryName, beanName);
+      if (server.isRegistered(name)) {
         server.unregisterMBean(name);
       }
     } catch (Exception e) {
@@ -227,7 +269,7 @@ public class JmxMonitoredMap<K, V> extends
     Hashtable<String, String> map = new Hashtable<>();
     map.put("type", key);
     if (infoBean.getName() != null && !"".equals(infoBean.getName())) {
-      map.put("id", infoBean.getName());
+      map.put(ID, infoBean.getName());
     }
     return ObjectName.getInstance(jmxRootName, map);
   }

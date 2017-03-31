@@ -586,6 +586,16 @@ public abstract class BaseStoredFieldsFormatTestCase extends BaseIndexFileFormat
       super.document(maxDoc() - 1 - docID, visitor);
     }
 
+    @Override
+    public CacheHelper getCoreCacheHelper() {
+      return null;
+    }
+
+    @Override
+    public CacheHelper getReaderCacheHelper() {
+      return null;
+    }
+
   }
 
   private static class DummyFilterDirectoryReader extends FilterDirectoryReader {
@@ -602,6 +612,11 @@ public abstract class BaseStoredFieldsFormatTestCase extends BaseIndexFileFormat
     @Override
     protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
       return new DummyFilterDirectoryReader(in);
+    }
+
+    @Override
+    public CacheHelper getReaderCacheHelper() {
+      return null;
     }
     
   }
@@ -663,6 +678,8 @@ public abstract class BaseStoredFieldsFormatTestCase extends BaseIndexFileFormat
 
   @Nightly
   public void testBigDocuments() throws IOException {
+    assumeWorkingMMapOnWindows();
+    
     // "big" as "much bigger than the chunk size"
     // for this test we force a FS dir
     // we can't just use newFSDirectory, because this test doesn't really index anything.

@@ -38,6 +38,7 @@ import org.apache.lucene.index.Term;
 //import org.apache.lucene.queryparser.classic.ParseException;
 //import org.apache.lucene.queryparser.classic.QueryParser;
 //import org.apache.lucene.queryparser.classic.QueryParserBase;
+import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.queryparser.classic.QueryParserBase;
 //import org.apache.lucene.queryparser.classic.QueryParserTokenManager;
 import org.apache.lucene.queryparser.flexible.standard.CommonQueryParserConfiguration;
@@ -263,7 +264,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
     }
   }
 
-  private class SimpleCJKAnalyzer extends Analyzer {
+  private static class SimpleCJKAnalyzer extends Analyzer {
     @Override
     public TokenStreamComponents createComponents(String fieldName) {
       return new TokenStreamComponents(new SimpleCJKTokenizer());
@@ -328,6 +329,9 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
   
     PhraseQuery expected = new PhraseQuery("field", "中", "国");
     CommonQueryParserConfiguration qp = getParserConfig(analyzer);
+    if (qp instanceof QueryParser) { // Always true, since TestStandardQP overrides this method
+      ((QueryParser)qp).setSplitOnWhitespace(true); // LUCENE-7533
+    }
     setAutoGeneratePhraseQueries(qp, true);
     assertEquals(expected, getQuery("中国",qp));
   }
@@ -1091,7 +1095,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
   }
 
   /** whitespace+lowercase analyzer with synonyms */
-  protected class Analyzer1 extends Analyzer {
+  protected static class Analyzer1 extends Analyzer {
     public Analyzer1(){
       super();
     }
@@ -1103,7 +1107,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
   }
   
   /** whitespace+lowercase analyzer without synonyms */
-  protected class Analyzer2 extends Analyzer {
+  protected static class Analyzer2 extends Analyzer {
     public Analyzer2(){
       super();
     }
@@ -1118,7 +1122,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
   /**
    * Mock collation analyzer: indexes terms as "collated" + term
    */
-  private class MockCollationFilter extends TokenFilter {
+  private static class MockCollationFilter extends TokenFilter {
     private final CharTermAttribute termAtt = addAttribute(CharTermAttribute.class);
 
     protected MockCollationFilter(TokenStream input) {
@@ -1137,7 +1141,7 @@ public abstract class QueryParserTestBase extends LuceneTestCase {
     }
     
   }
-  private class MockCollationAnalyzer extends Analyzer {
+  private static class MockCollationAnalyzer extends Analyzer {
     @Override
     public TokenStreamComponents createComponents(String fieldName) {
       Tokenizer tokenizer = new MockTokenizer(MockTokenizer.WHITESPACE, true);

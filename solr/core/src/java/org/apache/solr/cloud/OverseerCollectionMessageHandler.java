@@ -131,6 +131,7 @@ public class OverseerCollectionMessageHandler implements OverseerMessageHandler 
       ZkStateReader.REPLICATION_FACTOR, "1",
       ZkStateReader.MAX_SHARDS_PER_NODE, "1",
       ZkStateReader.AUTO_ADD_REPLICAS, "false",
+      ZkStateReader.REALTIME_REPLICAS, "-1",
       DocCollection.RULE, null,
       SNITCH, null));
 
@@ -938,6 +939,12 @@ public class OverseerCollectionMessageHandler implements OverseerMessageHandler 
         if (srsp != null) {
           NamedList results = new NamedList();
           processResponse(results, srsp, Collections.emptySet());
+          if (srsp.getSolrResponse().getResponse() == null) {
+            NamedList response = new NamedList();
+            response.add("STATUS", "failed");
+            return response;
+          }
+          
           String r = (String) srsp.getSolrResponse().getResponse().get("STATUS");
           if (r.equals("running")) {
             log.debug("The task is still RUNNING, continuing to wait.");

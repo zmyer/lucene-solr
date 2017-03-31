@@ -144,7 +144,7 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
     entry.docsWithFieldLength = meta.readLong();
     entry.numValues = meta.readLong();
     int tableSize = meta.readInt();
-    if (tableSize < -1 || tableSize > 256) {
+    if (tableSize > 256) {
       throw new CorruptIndexException("invalid table size: " + tableSize, meta);
     }
     if (tableSize >= 0) {
@@ -153,6 +153,11 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
       for (int i = 0; i < tableSize; ++i) {
         entry.table[i] = meta.readLong();
       }
+    }
+    if (tableSize < -1) {
+      entry.blockShift = -2 - tableSize;
+    } else {
+      entry.blockShift = -1;
     }
     entry.bitsPerValue = meta.readByte();
     entry.minValue = meta.readLong();
@@ -260,6 +265,7 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
 
   private static class NumericEntry {
     long[] table;
+    int blockShift;
     byte bitsPerValue;
     long docsWithFieldOffset;
     long docsWithFieldLength;
@@ -340,88 +346,224 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
     return getNumeric(entry);
   }
 
+  private static abstract class DenseNumericDocValues extends NumericDocValues {
+
+    final int maxDoc;
+    int doc = -1;
+
+    DenseNumericDocValues(int maxDoc) {
+      this.maxDoc = maxDoc;
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      if (target >= maxDoc) {
+        return doc = NO_MORE_DOCS;
+      }
+      return doc = target;
+    }
+
+    @Override
+    public boolean advanceExact(int target) {
+      doc = target;
+      return true;
+    }
+
+    @Override
+    public long cost() {
+      return maxDoc;
+    }
+
+  }
+
+  private static abstract class SparseNumericDocValues extends NumericDocValues {
+
+    final IndexedDISI disi;
+
+    SparseNumericDocValues(IndexedDISI disi) {
+      this.disi = disi;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      return disi.advance(target);
+    }
+
+    @Override
+    public boolean advanceExact(int target) throws IOException {
+      return disi.advanceExact(target);
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return disi.nextDoc();
+    }
+
+    @Override
+    public int docID() {
+      return disi.docID();
+    }
+
+    @Override
+    public long cost() {
+      return disi.cost();
+    }
+  }
+
   private NumericDocValues getNumeric(NumericEntry entry) throws IOException {
     if (entry.docsWithFieldOffset == -2) {
       // empty
       return DocValues.emptyNumeric();
     } else if (entry.docsWithFieldOffset == -1) {
       // dense
-      final LongValues normValues = getNumericValues(entry);
-      return new NumericDocValues() {
-
-        int doc = -1;
-
-        @Override
-        public long longValue() throws IOException {
-          return normValues.get(doc);
-        }
-
-        @Override
-        public int docID() {
-          return doc;
-        }
-
-        @Override
-        public int nextDoc() throws IOException {
-          return advance(doc + 1);
-        }
-
-        @Override
-        public int advance(int target) throws IOException {
-          if (target >= maxDoc) {
-            return doc = NO_MORE_DOCS;
+      if (entry.bitsPerValue == 0) {
+        return new DenseNumericDocValues(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return entry.minValue;
           }
-          return doc = target;
-        }
+        };
+      } else {
+        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+        if (entry.blockShift >= 0) {
+          // dense but split into blocks of different bits per value
+          final int shift = entry.blockShift;
+          final long mul = entry.gcd;
+          final int mask = (1 << shift) - 1;
+          return new DenseNumericDocValues(maxDoc) {
+            int block = -1;
+            long delta;
+            long offset;
+            long blockEndOffset;
+            LongValues values;
 
-        @Override
-        public boolean advanceExact(int target) {
-          doc = target;
-          return true;
+            @Override
+            public long longValue() throws IOException {
+              final int block = doc >>> shift;
+              if (this.block != block) {
+                int bitsPerValue;
+                do {
+                  offset = blockEndOffset;
+                  bitsPerValue = slice.readByte(offset++);
+                  delta = slice.readLong(offset);
+                  offset += Long.BYTES;
+                  if (bitsPerValue == 0) {
+                    blockEndOffset = offset;
+                  } else {
+                    final int length = slice.readInt(offset);
+                    offset += Integer.BYTES;
+                    blockEndOffset = offset + length;
+                  }
+                  this.block ++;
+                } while (this.block != block);
+                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+              }
+              return mul * values.get(doc & mask) + delta;
+            }
+          };
+        } else {
+          final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+          if (entry.table != null) {
+            final long[] table = entry.table;
+            return new DenseNumericDocValues(maxDoc) {
+              @Override
+              public long longValue() throws IOException {
+                return table[(int) values.get(doc)];
+              }
+            };
+          } else {
+            final long mul = entry.gcd;
+            final long delta = entry.minValue;
+            return new DenseNumericDocValues(maxDoc) {
+              @Override
+              public long longValue() throws IOException {
+                return mul * values.get(doc) + delta;
+              }
+            };
+          }
         }
-
-        @Override
-        public long cost() {
-          return maxDoc;
-        }
-
-      };
+      }
     } else {
       // sparse
-      final LongValues values = getNumericValues(entry);
       final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numValues);
-      return new NumericDocValues() {
+      if (entry.bitsPerValue == 0) {
+        return new SparseNumericDocValues(disi) {
+          @Override
+          public long longValue() throws IOException {
+            return entry.minValue;
+          }
+        };
+      } else {
+        final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+        if (entry.blockShift >= 0) {
+          // sparse and split into blocks of different bits per value
+          final int shift = entry.blockShift;
+          final long mul = entry.gcd;
+          final int mask = (1 << shift) - 1;
+          return new SparseNumericDocValues(disi) {
+            int block = -1;
+            long delta;
+            long offset;
+            long blockEndOffset;
+            LongValues values;
 
-        @Override
-        public int advance(int target) throws IOException {
-          return disi.advance(target);
+            @Override
+            public long longValue() throws IOException {
+              final int index = disi.index();
+              final int block = index >>> shift;
+              if (this.block != block) {
+                int bitsPerValue;
+                do {
+                  offset = blockEndOffset;
+                  bitsPerValue = slice.readByte(offset++);
+                  delta = slice.readLong(offset);
+                  offset += Long.BYTES;
+                  if (bitsPerValue == 0) {
+                    blockEndOffset = offset;
+                  } else {
+                    final int length = slice.readInt(offset);
+                    offset += Integer.BYTES;
+                    blockEndOffset = offset + length;
+                  }
+                  this.block ++;
+                } while (this.block != block);
+                values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+              }
+              return mul * values.get(index & mask) + delta;
+            }
+          };
+        } else {
+          final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+          if (entry.table != null) {
+            final long[] table = entry.table;
+            return new SparseNumericDocValues(disi) {
+              @Override
+              public long longValue() throws IOException {
+                return table[(int) values.get(disi.index())];
+              }
+            };
+          } else {
+            final long mul = entry.gcd;
+            final long delta = entry.minValue;
+            return new SparseNumericDocValues(disi) {
+              @Override
+              public long longValue() throws IOException {
+                return mul * values.get(disi.index()) + delta;
+              }
+            };
+          }
         }
-
-        @Override
-        public boolean advanceExact(int target) throws IOException {
-          return disi.advanceExact(target);
-        }
-
-        @Override
-        public int nextDoc() throws IOException {
-          return disi.nextDoc();
-        }
-
-        @Override
-        public int docID() {
-          return disi.docID();
-        }
-
-        @Override
-        public long cost() {
-          return disi.cost();
-        }
-
-        @Override
-        public long longValue() throws IOException {
-          return values.get(disi.index());
-        }
-      };
+      }
     }
   }
 
@@ -435,35 +577,149 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
       };
     } else {
       final RandomAccessInput slice = data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-      final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
-      if (entry.table != null) {
-        final long[] table = entry.table;
+      if (entry.blockShift >= 0) {
+        final int shift = entry.blockShift;
+        final long mul = entry.gcd;
+        final long mask = (1L << shift) - 1;
         return new LongValues() {
-          @Override
+          long block = -1;
+          long delta;
+          long offset;
+          long blockEndOffset;
+          LongValues values;
+
           public long get(long index) {
-            return table[(int) values.get(index)];
-          }
-        };
-      } else if (entry.gcd != 1) {
-        final long gcd = entry.gcd;
-        final long minValue = entry.minValue;
-        return new LongValues() {
-          @Override
-          public long get(long index) {
-            return values.get(index) * gcd + minValue;
-          }
-        };
-      } else if (entry.minValue != 0) {
-        final long minValue = entry.minValue;
-        return new LongValues() {
-          @Override
-          public long get(long index) {
-            return values.get(index) + minValue;
+            final long block = index >>> shift;
+            if (this.block != block) {
+              assert block > this.block : "Reading backwards is illegal: " + this.block + " < " + block;
+              int bitsPerValue;
+              do {
+                offset = blockEndOffset;
+                try {
+                  bitsPerValue = slice.readByte(offset++);
+                  delta = slice.readLong(offset);
+                  offset += Long.BYTES;
+                  if (bitsPerValue == 0) {
+                    blockEndOffset = offset;
+                  } else {
+                    final int length = slice.readInt(offset);
+                    offset += Integer.BYTES;
+                    blockEndOffset = offset + length;
+                  }
+                } catch (IOException e) {
+                  throw new RuntimeException(e);
+                }
+                this.block ++;
+              } while (this.block != block);
+              values = bitsPerValue == 0 ? LongValues.ZEROES : DirectReader.getInstance(slice, bitsPerValue, offset);
+            }
+            return mul * values.get(index & mask) + delta;
           }
         };
       } else {
-        return values;
+        final LongValues values = DirectReader.getInstance(slice, entry.bitsPerValue);
+        if (entry.table != null) {
+          final long[] table = entry.table;
+          return new LongValues() {
+            @Override
+            public long get(long index) {
+              return table[(int) values.get(index)];
+            }
+          };
+        } else if (entry.gcd != 1) {
+          final long gcd = entry.gcd;
+          final long minValue = entry.minValue;
+          return new LongValues() {
+            @Override
+            public long get(long index) {
+              return values.get(index) * gcd + minValue;
+            }
+          };
+        } else if (entry.minValue != 0) {
+          final long minValue = entry.minValue;
+          return new LongValues() {
+            @Override
+            public long get(long index) {
+              return values.get(index) + minValue;
+            }
+          };
+        } else {
+          return values;
+        }
       }
+    }
+  }
+
+  private static abstract class DenseBinaryDocValues extends BinaryDocValues {
+
+    final int maxDoc;
+    int doc = -1;
+
+    DenseBinaryDocValues(int maxDoc) {
+      this.maxDoc = maxDoc;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return advance(doc + 1);
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public long cost() {
+      return maxDoc;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      if (target >= maxDoc) {
+        return doc = NO_MORE_DOCS;
+      }
+      return doc = target;
+    }
+
+    @Override
+    public boolean advanceExact(int target) throws IOException {
+      doc = target;
+      return true;
+    }
+  }
+
+  private static abstract class SparseBinaryDocValues extends BinaryDocValues {
+
+    final IndexedDISI disi;
+
+    SparseBinaryDocValues(IndexedDISI disi) {
+      this.disi = disi;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return disi.nextDoc();
+    }
+
+    @Override
+    public int docID() {
+      return disi.docID();
+    }
+
+    @Override
+    public long cost() {
+      return disi.cost();
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      return disi.advance(target);
+    }
+
+    @Override
+    public boolean advanceExact(int target) throws IOException {
+      return disi.advanceExact(target);
     }
   }
 
@@ -474,114 +730,75 @@ final class Lucene70DocValuesProducer extends DocValuesProducer implements Close
       return DocValues.emptyBinary();
     }
 
-    IndexInput bytesSlice = data.slice("fixed-binary", entry.dataOffset, entry.dataLength);
-    BytesRefs bytesRefs;
-    if (entry.minLength == entry.maxLength) {
-      bytesRefs = new BytesRefs() {
-        BytesRef bytes = new BytesRef(new byte[entry.maxLength], 0, entry.maxLength);
-        @Override
-        public BytesRef get(int index) throws IOException {
-          bytesSlice.seek((long) index * bytes.length);
-          bytesSlice.readBytes(bytes.bytes, 0, bytes.length);
-          return bytes;
-        }
-      };
-    } else {
-      final RandomAccessInput addressesData = this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
-      final LongValues addresses = DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData);
-      bytesRefs = new BytesRefs() {
-        BytesRef bytes = new BytesRef(entry.maxLength);
-        @Override
-        BytesRef get(int index) throws IOException {
-          long startOffset = addresses.get(index);
-          bytes.length = (int) (addresses.get(index + 1L) - startOffset);
-          bytesSlice.seek(startOffset);
-          bytesSlice.readBytes(bytes.bytes, 0, bytes.length);
-          return bytes;
-        }
-      };
-    }
+    final IndexInput bytesSlice = data.slice("fixed-binary", entry.dataOffset, entry.dataLength);
 
     if (entry.docsWithFieldOffset == -1) {
       // dense
-      return new BinaryDocValues() {
+      if (entry.minLength == entry.maxLength) {
+        // fixed length
+        final int length = entry.maxLength;
+        return new DenseBinaryDocValues(maxDoc) {
+          final BytesRef bytes = new BytesRef(new byte[length], 0, length);
 
-        int doc = -1;
-
-        @Override
-        public int nextDoc() throws IOException {
-          return advance(doc + 1);
-        }
-
-        @Override
-        public int docID() {
-          return doc;
-        }
-
-        @Override
-        public long cost() {
-          return maxDoc;
-        }
-
-        @Override
-        public int advance(int target) throws IOException {
-          if (target >= maxDoc) {
-            return doc = NO_MORE_DOCS;
+          @Override
+          public BytesRef binaryValue() throws IOException {
+            bytesSlice.seek((long) doc * length);
+            bytesSlice.readBytes(bytes.bytes, 0, length);
+            return bytes;
           }
-          return doc = target;
-        }
+        };
+      } else {
+        // variable length
+        final RandomAccessInput addressesData = this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+        final LongValues addresses = DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData);
+        return new DenseBinaryDocValues(maxDoc) {
+          final BytesRef bytes = new BytesRef(new byte[entry.maxLength], 0, entry.maxLength);
 
-        @Override
-        public boolean advanceExact(int target) throws IOException {
-          doc = target;
-          return true;
-        }
-
-        @Override
-        public BytesRef binaryValue() throws IOException {
-          return bytesRefs.get(doc);
-        }
-      };
+          @Override
+          public BytesRef binaryValue() throws IOException {
+            long startOffset = addresses.get(doc);
+            bytes.length = (int) (addresses.get(doc + 1L) - startOffset);
+            bytesSlice.seek(startOffset);
+            bytesSlice.readBytes(bytes.bytes, 0, bytes.length);
+            return bytes;
+          }
+        };
+      }
     } else {
       // sparse
       final IndexedDISI disi = new IndexedDISI(data, entry.docsWithFieldOffset, entry.docsWithFieldLength, entry.numDocsWithField);
-      return new BinaryDocValues() {
+      if (entry.minLength == entry.maxLength) {
+        // fixed length
+        final int length = entry.maxLength;
+        return new SparseBinaryDocValues(disi) {
+          final BytesRef bytes = new BytesRef(new byte[length], 0, length);
 
-        @Override
-        public int nextDoc() throws IOException {
-          return disi.nextDoc();
-        }
+          @Override
+          public BytesRef binaryValue() throws IOException {
+            bytesSlice.seek((long) disi.index() * length);
+            bytesSlice.readBytes(bytes.bytes, 0, length);
+            return bytes;
+          }
+        };
+      } else {
+        // variable length
+        final RandomAccessInput addressesData = this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+        final LongValues addresses = DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData);
+        return new SparseBinaryDocValues(disi) {
+          final BytesRef bytes = new BytesRef(new byte[entry.maxLength], 0, entry.maxLength);
 
-        @Override
-        public int docID() {
-          return disi.docID();
-        }
-
-        @Override
-        public long cost() {
-          return disi.cost();
-        }
-
-        @Override
-        public int advance(int target) throws IOException {
-          return disi.advance(target);
-        }
-
-        @Override
-        public boolean advanceExact(int target) throws IOException {
-          return disi.advanceExact(target);
-        }
-
-        @Override
-        public BytesRef binaryValue() throws IOException {
-          return bytesRefs.get(disi.index());
-        }
-      };
+          @Override
+          public BytesRef binaryValue() throws IOException {
+            final int index = disi.index();
+            long startOffset = addresses.get(index);
+            bytes.length = (int) (addresses.get(index + 1L) - startOffset);
+            bytesSlice.seek(startOffset);
+            bytesSlice.readBytes(bytes.bytes, 0, bytes.length);
+            return bytes;
+          }
+        };
+      }
     }
-  }
-
-  private static abstract class BytesRefs {
-    abstract BytesRef get(int index) throws IOException;
   }
 
   @Override

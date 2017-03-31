@@ -21,6 +21,12 @@
 # affecting other Java applications on your server/workstation.
 #SOLR_JAVA_HOME=""
 
+# This controls the number of seconds that the solr script will wait for
+# Solr to stop gracefully or Solr to start.  If the graceful stop fails,
+# the script will forcibly stop Solr.  If the start fails, the script will
+# give up waiting and display the last few lines of the logfile.
+#SOLR_STOP_WAIT="180"
+
 # Increase Java Heap as needed to support your indexing / query needs
 #SOLR_HEAP="512m"
 
@@ -28,9 +34,16 @@
 # Comment out SOLR_HEAP if you are using this though, that takes precedence
 #SOLR_JAVA_MEM="-Xms512m -Xmx512m"
 
-# Enable verbose GC logging
+# Enable verbose GC logging...
+#  * If this is unset, various default options will be selected depending on which JVM version is in use
+#  * For java8 or lower: if this is set, additional params will be added to specify the log file & rotation
+#  * For java9 or higher: each included opt param that starts with '-Xlog:gc', but does not include an output
+#    specifier, will have a 'file' output specifier (as well as formatting & rollover options) appended,
+#    using the effective value of the SOLR_LOGS_DIR.
+#
+#GC_LOG_OPTS='-Xlog:gc*'  # (java9)
 #GC_LOG_OPTS="-verbose:gc -XX:+PrintHeapAtGC -XX:+PrintGCDetails \
-#-XX:+PrintGCDateStamps -XX:+PrintGCTimeStamps -XX:+PrintTenuringDistribution -XX:+PrintGCApplicationStoppedTime"
+#  -XX:+PrintGCDateStamps -XX:+PrintGCTimeStamps -XX:+PrintTenuringDistribution -XX:+PrintGCApplicationStoppedTime"
 
 # These GC settings have shown to work well for a number of common Solr workloads
 #GC_TUNE="-XX:NewRatio=3 -XX:SurvivorRatio=4    etc.
@@ -85,6 +98,11 @@
 # Location where Solr should write logs to. Absolute or relative to solr start dir
 #SOLR_LOGS_DIR=logs
 
+# Enables log rotation, cleanup, and archiving during start. Setting SOLR_LOG_PRESTART_ROTATION=false will skip start
+# time rotation of logs, and the archiving of the last GC and console log files. It does not affect Log4j configuration.
+# This pre-startup rotation may need to be disabled depending how much you customize the default logging setup.
+#SOLR_LOG_PRESTART_ROTATION=true
+
 # Sets the port Solr binds to, default is 8983
 #SOLR_PORT=8983
 
@@ -92,8 +110,10 @@
 # Be sure to update the paths to the correct keystore for your environment
 #SOLR_SSL_KEY_STORE=/home/shalin/work/oss/shalin-lusolr/solr/server/etc/solr-ssl.keystore.jks
 #SOLR_SSL_KEY_STORE_PASSWORD=secret
+#SOLR_SSL_KEY_STORE_TYPE=JKS
 #SOLR_SSL_TRUST_STORE=/home/shalin/work/oss/shalin-lusolr/solr/server/etc/solr-ssl.keystore.jks
 #SOLR_SSL_TRUST_STORE_PASSWORD=secret
+#SOLR_SSL_TRUST_STORE_TYPE=JKS
 #SOLR_SSL_NEED_CLIENT_AUTH=false
 #SOLR_SSL_WANT_CLIENT_AUTH=false
 
@@ -101,11 +121,15 @@
 # otherwise keep them commented and the above values will automatically be set for HTTP clients
 #SOLR_SSL_CLIENT_KEY_STORE=
 #SOLR_SSL_CLIENT_KEY_STORE_PASSWORD=
+#SOLR_SSL_CLIENT_KEY_STORE_TYPE=
 #SOLR_SSL_CLIENT_TRUST_STORE=
 #SOLR_SSL_CLIENT_TRUST_STORE_PASSWORD=
+#SOLR_SSL_CLIENT_TRUST_STORE_TYPE=
 
 # Settings for authentication
-#SOLR_AUTHENTICATION_CLIENT_BUILDER=
+# Please configure only one of SOLR_AUTHENTICATION_CLIENT_BUILDER or SOLR_AUTH_TYPE parameters
+#SOLR_AUTHENTICATION_CLIENT_BUILDER="org.apache.solr.client.solrj.impl.PreemptiveBasicAuthClientBuilderFactory"
+#SOLR_AUTH_TYPE="basic"
 #SOLR_AUTHENTICATION_OPTS="-Dbasicauth=solr:SolrRocks"
 
 # Settings for ZK ACL
